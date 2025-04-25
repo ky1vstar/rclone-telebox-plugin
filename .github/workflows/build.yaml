@@ -28,7 +28,7 @@ jobs:
           go build -buildmode=plugin -o librcloneplugin_telebox.so
       
       - name: Setup environment
-        run: echo "RCLONE_PLUGIN_PATH=${{ github.workspace }}"
+        run: echo "RCLONE_PLUGIN_PATH=${{ github.workspace }}" >> $GITHUB_ENV
       
       - name: Test rclone plugin integration
         run: rclone help backend telebox
