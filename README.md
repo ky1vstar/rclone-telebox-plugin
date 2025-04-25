@@ -31,7 +31,7 @@ XX / TeleBox
 Storage> XX
 
 Option token.
-Authorize on https://telebox.online, then go to developer console of the browser and paste here the out of `localStorage.t` command
+Authorize on https://telebox.online, then go to developer console of the browser and paste here the output of `localStorage.t` command
 Enter a value.
 token> testFromCLToken
 
@@ -53,7 +53,7 @@ Here are the Standard options specific to telebox (TeleBox).
 
 #### --telebox-token
 
-Authorize on https://telebox.online, then go to developer console of the browser and paste here the out of `localStorage.t` command
+Authorize on https://telebox.online, then go to developer console of the browser and paste here the output of `localStorage.t` command
 
 Properties:
 

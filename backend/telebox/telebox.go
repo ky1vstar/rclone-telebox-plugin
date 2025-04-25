@@ -54,7 +54,7 @@ func Register() {
 		NewFs:       NewFs,
 		Options: []fs.Option{{
 			Name:      "token",
-			Help:      "Authorize on https://telebox.online, then go to developer console of the browser and paste here the out of `localStorage.t` command",
+			Help:      "Authorize on https://telebox.online, then go to developer console of the browser and paste here the output of `localStorage.t` command",
 			Sensitive: true,
 			Required:  true,
 		}},
