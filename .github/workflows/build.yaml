@@ -1,0 +1,34 @@
+name: Build
+
+on:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.21
+          check-latest: true
+      
+      - name: Build rclone
+        run: |
+          git clone --depth 1 --branch v1.69.1 https://github.com/rclone/rclone
+          cd rclone
+          go build -o /usr/local/bin/rclone
+      
+      - name: Build plugin
+        run: |
+          go mod edit -replace "github.com/rclone/rclone=${{ github.workspace }}/rclone"
+          go build -buildmode=plugin -o librcloneplugin_telebox.so
+      
+      - name: Setup environment
+        run: echo "RCLONE_PLUGIN_PATH=${{ github.workspace }}"
+      
+      - name: Test rclone plugin integration
+        run: rclone help backend telebox

@@ -47,7 +47,7 @@ const (
 	rootID             = "0" // ID of root directory
 )
 
-func Init() {
+func Register() {
 	fsi := &fs.RegInfo{
 		Name:        "telebox",
 		Description: "TeleBox",

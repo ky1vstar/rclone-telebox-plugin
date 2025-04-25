@@ -5,5 +5,5 @@ import (
 )
 
 func init() {
-	telebox.Init()
+	telebox.Register()
 }
