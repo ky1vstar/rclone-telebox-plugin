@@ -1015,6 +1015,208 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return f.purgeCheck(ctx, dir, false)
 }
 
+// Move src to this remote using server-side move operations.
+//
+// This is stored with the remote path given.
+//
+// It returns the destination Object and a possible error.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantMove
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't move - not same remote type")
+		return nil, fs.ErrorCantMove
+	}
+
+	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// Move
+	move := func(newPID string) error {
+		opts := &rest.Opts{
+			Method:  "GET",
+			RootURL: linkboxAPIURL,
+			Path:    "file/move",
+			Parameters: url.Values{
+				"token":   {f.opt.Token},
+				"itemIds": {srcObj.itemID},
+				"pid":     {newPID},
+			},
+		}
+
+		moveResponse := response{}
+		err := getUnmarshaledResponse(ctx, f, opts, &moveResponse)
+		if err != nil {
+			return fmt.Errorf("Failed to move item: %w", err)
+		}
+		return nil
+	}
+
+	didMove := false
+	if itoa64(srcObj.dirID) != dirID {
+		err := move(dirID)
+		if err != nil {
+			return nil, err
+		}
+		didMove = true
+	}
+
+	// Rename
+	rename := func(newName string) error {
+		opts := &rest.Opts{
+			Method:  "GET",
+			RootURL: linkboxAPIURL,
+			Path:    "file/rename",
+			Parameters: url.Values{
+				"token":  {f.opt.Token},
+				"itemId": {srcObj.itemID},
+				"name":   {newName},
+			},
+		}
+
+		renameResponse := response{}
+		err := getUnmarshaledResponse(ctx, f, opts, &renameResponse)
+		if err != nil {
+			return fmt.Errorf("Failed to rename item: %w", err)
+		}
+		return nil
+	}
+
+	_, srcName := splitDirAndName(srcObj.remote)
+	if srcName != leaf {
+		err := rename(leaf)
+		if err != nil {
+			if didMove {
+				_ = move(itoa64(srcObj.dirID))
+			}
+			return nil, err
+		}
+	}
+
+	// Try to read remote object
+	dstObj := &Object{
+		fs:     f,
+		remote: remote,
+	}
+
+	opts := &rest.Opts{
+		Method:  "GET",
+		RootURL: linkboxAPIURL,
+		Path:    "file/detail",
+		Parameters: url.Values{
+			"token":  {f.opt.Token},
+			"itemId": {srcObj.itemID},
+		},
+	}
+
+	getFileDetailResult := fileDetailRes{}
+	err = getUnmarshaledResponse(ctx, f, opts, &getFileDetailResult)
+	if err != nil {
+		return nil, fmt.Errorf("Update failed to read object: %w", err)
+	}
+
+	if getFileDetailResult.Data.ItemInfo.Name != leaf {
+		if didMove {
+			_ = move(itoa64(srcObj.dirID))
+		}
+		return nil, fmt.Errorf("Failed to rename item regardless server returned success response")
+	}
+
+	dstObj.set(&getFileDetailResult.Data.ItemInfo)
+	return dstObj, nil
+}
+
+// DirMove moves src, srcRemote to this remote at dstRemote
+// using server-side move operations.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantDirMove
+//
+// If destination exists then return fs.ErrorDirExists
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	srcFs, ok := src.(*Fs)
+	if !ok {
+		fs.Debugf(srcFs, "Can't move directory - not same remote type")
+		return fs.ErrorCantDirMove
+	}
+
+	srcDirId, srcDirPID, srcLeaf, dstDirPID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
+	if err != nil {
+		return err
+	}
+
+	fs.Debugf(src, "DirMove srcRemote(%s) srcDirId(%s) srcLeaf(%s) srcDirPID(%s) dstRemote(%s) dstLeaf(%s) dstDirPID(%s)", dstRemote, srcDirId, srcLeaf, srcDirPID, dstRemote, dstLeaf, dstDirPID)
+
+	// Move
+	move := func(newPID string) error {
+		opts := &rest.Opts{
+			Method:  "GET",
+			RootURL: linkboxAPIURL,
+			Path:    "file/move",
+			Parameters: url.Values{
+				"token":  {f.opt.Token},
+				"dirIds": {srcDirId},
+				"pid":    {newPID},
+			},
+		}
+
+		moveResponse := response{}
+		err := getUnmarshaledResponse(ctx, f, opts, &moveResponse)
+		if err != nil {
+			return fmt.Errorf("Failed to move directory: %w", err)
+		}
+		return nil
+	}
+
+	didMove := false
+	if srcDirPID != dstDirPID {
+		err := move(dstDirPID)
+		if err != nil {
+			return err
+		}
+		didMove = true
+	}
+
+	// Rename
+	rename := func(newName string) error {
+		opts := &rest.Opts{
+			Method:  "GET",
+			RootURL: linkboxAPIURL,
+			Path:    "file/rename",
+			Parameters: url.Values{
+				"token": {f.opt.Token},
+				"dirId": {srcDirId},
+				"name":  {newName},
+			},
+		}
+
+		renameResponse := response{}
+		err := getUnmarshaledResponse(ctx, f, opts, &renameResponse)
+		if err != nil {
+			return fmt.Errorf("Failed to rename directory: %w", err)
+		}
+		return nil
+	}
+
+	if srcLeaf != dstLeaf {
+		err := rename(dstLeaf)
+		if err != nil {
+			if didMove {
+				_ = move(srcDirPID)
+			}
+			return nil
+		}
+	}
+
+	return nil
+}
+
 // retryErrorCodes is a slice of error codes that we will retry
 var retryErrorCodes = []int{
 	429, // Too Many Requests.
@@ -1100,6 +1302,8 @@ var (
 	_ fs.Fs              = &Fs{}
 	_ fs.Purger          = &Fs{}
 	_ fs.DirCacheFlusher = &Fs{}
-	_ fs.Abouter         = (*Fs)(nil)
+	_ fs.Mover           = &Fs{}
+	_ fs.DirMover        = &Fs{}
+	_ fs.Abouter         = &Fs{}
 	_ fs.Object          = &Object{}
 )
