@@ -1,13 +1,13 @@
-// Package linkbox provides an interface to the linkbox.to Cloud storage system.
+// Package telebox provides an interface to the telebox.online Cloud storage system.
 //
-// API docs: https://www.linkbox.to/api-docs
+// Uses undocumented APIs reverse engineered from the web interface.
 package telebox
 
 /*
    Extras
    - PublicLink - NO - sharing doesn't share the actual file, only a page with it on
    - Move - YES - have Move and Rename file APIs so is possible
-   - MoveDir - NO - probably not possible - have Move but no Rename
+   - MoveDir - YES - have Move and Rename folder APIs so is possible
 */
 
 import (
@@ -29,6 +29,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
@@ -39,24 +40,40 @@ import (
 )
 
 const (
+	configEmail        = "email"
+	configPassword     = "password"
+	configToken        = "token"
 	maxEntitiesPerPage = 1000
 	minSleep           = 200 * time.Millisecond
 	maxSleep           = 2 * time.Second
 	pacerBurst         = 1
-	linkboxAPIURL      = "https://www.telebox.online/api/"
+	teleboxAPIURL      = "https://www.telebox.online/api/"
 	rootID             = "0" // ID of root directory
 )
 
-func Register() {
+func init() {
 	fsi := &fs.RegInfo{
 		Name:        "telebox",
 		Description: "TeleBox",
 		NewFs:       NewFs,
 		Options: []fs.Option{{
-			Name:      "token",
-			Help:      "Authorize on https://telebox.online, then go to developer console of the browser and paste here the output of `localStorage.t` command",
-			Sensitive: true,
+			Name:      configEmail,
+			Help:      "Email.",
 			Required:  true,
+			Sensitive: true,
+		}, {
+			Name:       configPassword,
+			Help:       "Password.",
+			IsPassword: true,
+			Required:   true,
+			Sensitive:  true,
+		}, {
+			Name:       configToken,
+			Help:       "Auth token (internal use only)",
+			IsPassword: false,
+			Required:   false,
+			Sensitive:  true,
+			Hide:       fs.OptionHideBoth,
 		}},
 	}
 	fs.Register(fsi)
@@ -64,10 +81,12 @@ func Register() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	Token string `config:"token"`
+	Email    string `config:"email"`
+	Password string `config:"password"`
+	Token    string `config:"token"`
 }
 
-// Fs stores the interface to the remote Linkbox files
+// Fs stores the interface to the remote TeleBox files
 type Fs struct {
 	name     string
 	root     string
@@ -77,6 +96,7 @@ type Fs struct {
 	srv      *rest.Client       // the connection to the server
 	dirCache *dircache.DirCache // Map of directory path to directory id
 	pacer    *fs.Pacer
+	m        configmap.Mapper
 }
 
 // Object is a remote object that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -115,6 +135,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		srv:  rest.NewClient(fshttp.NewClient(ctx)),
 
 		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep))),
+		m:     m,
 	}
 	f.dirCache = dircache.New(root, rootID, f)
 
@@ -193,10 +214,10 @@ func (o *Object) set(e *entity) {
 	o.dirID = e.Pid
 }
 
-// Call linkbox with the query in opts and return result
+// Call telebox with the query in opts and return result
 //
 // This will be checked for error and an error will be returned if Status != 1
-func getUnmarshaledResponse(ctx context.Context, f *Fs, opts *rest.Opts, result any) error {
+func getUnauthorizedResponse(ctx context.Context, f *Fs, opts *rest.Opts, result any) error {
 	err := f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.CallJSON(ctx, opts, nil, &result)
 		return f.shouldRetry(ctx, resp, err)
@@ -211,6 +232,80 @@ func getUnmarshaledResponse(ctx context.Context, f *Fs, opts *rest.Opts, result 
 	return nil
 }
 
+// Call telebox with the query in opts and return result
+//
+// This will be checked for error and an error will be returned if Status != 1
+// If the token is expired it will reauthenticate and try again
+func getUnmarshaledResponse(ctx context.Context, f *Fs, opts *rest.Opts, result any) error {
+	if f.opt.Token == "" {
+		fs.Debugf(f, "No token. Logging in...")
+		err := f.Login(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	opts.Parameters.Set("token", f.opt.Token)
+
+	err := f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.CallJSON(ctx, opts, nil, &result)
+		return f.shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return err
+	}
+	responser := result.(responser)
+	if responser.IsError() {
+		if strings.HasPrefix(responser.GetMessage(), "login in need") {
+			fs.Debugf(f, "Token expired. Reauthenticating...")
+			err := f.Login(ctx)
+			if err != nil {
+				return err
+			}
+			return getUnmarshaledResponse(ctx, f, opts, result)
+		}
+		return responser
+	}
+	return nil
+}
+
+// Returned from "user/login_email"
+type loginRes struct {
+	response
+	Data struct {
+		Token string `json:"token"`
+	} `json:"data"`
+}
+
+// Login logs in and gets a token
+func (f *Fs) Login(ctx context.Context) (err error) {
+	password, err := obscure.Reveal(f.opt.Password)
+	if err != nil {
+		return err
+	}
+
+	opts := &rest.Opts{
+		Method:  "GET",
+		RootURL: teleboxAPIURL,
+		Path:    "user/login_email",
+		Parameters: url.Values{
+			"email": {f.opt.Email},
+			"pwd":   {password},
+		},
+	}
+
+	response := loginRes{}
+	err = getUnauthorizedResponse(ctx, f, opts, &response)
+	if err != nil {
+		if responser, ok := err.(responser); ok && responser.GetMessage() == "LoginEmailNoAccount" {
+			return fserrors.NoRetryError(fmt.Errorf("bad email or password"))
+		}
+		return err
+	}
+	f.opt.Token = response.Data.Token
+	f.m.Set(configToken, f.opt.Token)
+	return nil
+}
+
 // list the objects into the function supplied
 //
 // If directories is set it only sends directories
@@ -222,7 +317,7 @@ type listAllFn func(*entity) bool
 // Search is a bit fussy about which characters match
 //
 // If the name doesn't match this then do an dir list instead
-// N.B.: Linkbox doesn't support search by name that is longer than 50 chars
+// N.B.: TeleBox doesn't support search by name that is longer than 50 chars
 var searchOK = regexp.MustCompile(`^[a-zA-Z0-9_ -.]{1,50}$`)
 
 // Lists the directory required calling the user function on each item found
@@ -248,10 +343,9 @@ OUTER:
 		pageNumber++
 		opts := &rest.Opts{
 			Method:  "GET",
-			RootURL: linkboxAPIURL,
+			RootURL: teleboxAPIURL,
 			Path:    "file/my_file_list/web",
 			Parameters: url.Values{
-				"token":    {f.opt.Token},
 				"name":     {name},
 				"pid":      {dirID},
 				"pageNo":   {itoa(pageNumber)},
@@ -335,10 +429,9 @@ func (f *Fs) CreateDir(ctx context.Context, dirID, leaf string) (newID string, e
 	// fs.Debugf(f, "CreateDir(%q, %q)\n", dirID, leaf)
 	opts := &rest.Opts{
 		Method:  "GET",
-		RootURL: linkboxAPIURL,
+		RootURL: teleboxAPIURL,
 		Path:    "file/create_folder/web",
 		Parameters: url.Values{
-			"token":       {f.opt.Token},
 			"name":        {leaf},
 			"pid":         {dirID},
 			"isShare":     {"0"},
@@ -481,10 +574,9 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	}
 	opts := &rest.Opts{
 		Method:  "GET",
-		RootURL: linkboxAPIURL,
+		RootURL: teleboxAPIURL,
 		Path:    "file/delete",
 		Parameters: url.Values{
-			"token":  {f.opt.Token},
 			"dirIds": {directoryID},
 		},
 	}
@@ -492,7 +584,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	response := response{}
 	err = getUnmarshaledResponse(ctx, f, opts, &response)
 	if err != nil {
-		// Linkbox has some odd error returns here
+		// TeleBox has some odd error returns here
 		if response.Status == 403 || response.Status == 500 {
 			return fs.ErrorDirNotFound
 		}
@@ -600,11 +692,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	authorizeUpload := func() error {
 		opts := &rest.Opts{
 			Method:  "GET",
-			RootURL: linkboxAPIURL,
+			RootURL: teleboxAPIURL,
 			Path:    "file/get_file_upload_session",
 			Options: options,
 			Parameters: url.Values{
-				"token":      {o.fs.opt.Token},
 				"scene":      {"common"},
 				"vgroupType": {"md5_10m"},
 				"vgroup":     {fmt.Sprintf("%x_%d", md5.Sum(first10mBytes), size)},
@@ -687,7 +778,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			fs.Debugf(o, "Starting to upload part %d/%d", partNumber, numberOfParts)
 
 			var tempFile *os.File
-			tempFile, err = os.CreateTemp("", "rclone-linkb-")
+			tempFile, err = os.CreateTemp("", "rclone-teleb-")
 			if err != nil {
 				return fmt.Errorf("Failed to create temp file: %w", err)
 			}
@@ -777,7 +868,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		// Status means that we don't need to upload file
 		// We need only to make second step
 	default:
-		return fmt.Errorf("got unexpected message from Linkbox: %s", getFirstStepResult.Message)
+		return fmt.Errorf("got unexpected message from TeleBox: %s", getFirstStepResult.Message)
 	}
 
 	leaf, dirID, err := o.fs.dirCache.FindPath(ctx, remote, false)
@@ -785,14 +876,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
-	// create file item at Linkbox (second step)
+	// create file item at TeleBox (second step)
 	opts := &rest.Opts{
 		Method:  "GET",
-		RootURL: linkboxAPIURL,
+		RootURL: teleboxAPIURL,
 		Path:    "file/create_item",
 		Options: options,
 		Parameters: url.Values{
-			"token":      {o.fs.opt.Token},
 			"vgroupType": {"md5_10m"},
 			"vgroup":     {fmt.Sprintf("%x_%d", md5.Sum(first10mBytes), size)},
 			"pid":        {dirID},
@@ -810,11 +900,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// Try to read remote object
 	opts = &rest.Opts{
 		Method:  "GET",
-		RootURL: linkboxAPIURL,
+		RootURL: teleboxAPIURL,
 		Path:    "file/detail",
 		Options: options,
 		Parameters: url.Values{
-			"token":  {o.fs.opt.Token},
 			"itemId": {getSecondStepResult.Data.ItemID},
 		},
 	}
@@ -833,10 +922,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 func (o *Object) Remove(ctx context.Context) error {
 	opts := &rest.Opts{
 		Method:  "GET",
-		RootURL: linkboxAPIURL,
+		RootURL: teleboxAPIURL,
 		Path:    "file/delete",
 		Parameters: url.Values{
-			"token":   {o.fs.opt.Token},
 			"itemIds": {o.itemID},
 		},
 	}
@@ -907,7 +995,7 @@ func (f *Fs) Root() string {
 
 // String returns a description of the FS
 func (f *Fs) String() string {
-	return fmt.Sprintf("Linkbox root '%s'", f.root)
+	return fmt.Sprintf("TeleBox root '%s'", f.root)
 }
 
 // Precision of the ModTimes in this Fs
@@ -937,6 +1025,11 @@ type response struct {
 	Status  int    `json:"status"`
 }
 
+// GetMessage returns the message from the response
+func (r *response) GetMessage() string {
+	return r.Message
+}
+
 // IsError returns whether response represents an error
 func (r *response) IsError() bool {
 	return r.Status != 1
@@ -944,11 +1037,12 @@ func (r *response) IsError() bool {
 
 // Error returns the error state of this response
 func (r *response) Error() string {
-	return fmt.Sprintf("Linkbox error %d: %s", r.Status, r.Message)
+	return fmt.Sprintf("TeleBox error %d: %s", r.Status, r.Message)
 }
 
 // responser is interface covering the response so we can use it when it is embedded.
 type responser interface {
+	GetMessage() string
 	IsError() bool
 	Error() string
 }
@@ -1040,10 +1134,9 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	move := func(newPID string) error {
 		opts := &rest.Opts{
 			Method:  "GET",
-			RootURL: linkboxAPIURL,
+			RootURL: teleboxAPIURL,
 			Path:    "file/move",
 			Parameters: url.Values{
-				"token":   {f.opt.Token},
 				"itemIds": {srcObj.itemID},
 				"pid":     {newPID},
 			},
@@ -1070,10 +1163,9 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	rename := func(newName string) error {
 		opts := &rest.Opts{
 			Method:  "GET",
-			RootURL: linkboxAPIURL,
+			RootURL: teleboxAPIURL,
 			Path:    "file/rename",
 			Parameters: url.Values{
-				"token":  {f.opt.Token},
 				"itemId": {srcObj.itemID},
 				"name":   {newName},
 			},
@@ -1106,10 +1198,9 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	opts := &rest.Opts{
 		Method:  "GET",
-		RootURL: linkboxAPIURL,
+		RootURL: teleboxAPIURL,
 		Path:    "file/detail",
 		Parameters: url.Values{
-			"token":  {f.opt.Token},
 			"itemId": {srcObj.itemID},
 		},
 	}
@@ -1157,10 +1248,9 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	move := func(newPID string) error {
 		opts := &rest.Opts{
 			Method:  "GET",
-			RootURL: linkboxAPIURL,
+			RootURL: teleboxAPIURL,
 			Path:    "file/move",
 			Parameters: url.Values{
-				"token":  {f.opt.Token},
 				"dirIds": {srcDirId},
 				"pid":    {newPID},
 			},
@@ -1187,10 +1277,9 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	rename := func(newName string) error {
 		opts := &rest.Opts{
 			Method:  "GET",
-			RootURL: linkboxAPIURL,
+			RootURL: teleboxAPIURL,
 			Path:    "file/rename",
 			Parameters: url.Values{
-				"token": {f.opt.Token},
 				"dirId": {srcDirId},
 				"name":  {newName},
 			},
@@ -1276,12 +1365,10 @@ type userInfoRes struct {
 // About gets quota information
 func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	opts := &rest.Opts{
-		Method:  "GET",
-		RootURL: linkboxAPIURL,
-		Path:    "user/info",
-		Parameters: url.Values{
-			"token": {f.opt.Token},
-		},
+		Method:     "GET",
+		RootURL:    teleboxAPIURL,
+		Path:       "user/info",
+		Parameters: url.Values{},
 	}
 
 	response := userInfoRes{}
